@@ -1,5 +1,7 @@
 """
-Polymarket — fetches temperature markets, parses event titles dynamically.
+Polymarket — fetches temperature markets from the weather section.
+Strictly validates that outcomes are real temperature buckets (not Yes/No).
+Filters out non-city "cities" like 'prison', 'the NBA', etc.
 """
 
 import asyncio
@@ -13,10 +15,43 @@ from config import POLYMARKET_GAMMA_API, POLYMARKET_WEB_URL
 
 logger = logging.getLogger(__name__)
 
-TEMPERATURE_ENDPOINTS = [
+# Try weather tag (more reliable) and temperature tag
+ENDPOINTS = [
+    f"{POLYMARKET_GAMMA_API}/events?tag=weather&active=true&closed=false&limit=100",
     f"{POLYMARKET_GAMMA_API}/events?tag=temperature&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/events?tag_slug=temperature&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/markets?tag=temperature&active=true&closed=false&limit=100",
+    f"{POLYMARKET_GAMMA_API}/events?tag_slug=weather&active=true&closed=false&limit=100",
+]
+
+# Outcomes must match this to be a real temperature bucket
+TEMP_OUTCOME_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        \d{1,3}(?:\.\d+)?\s*[-–to]+\s*\d{1,3}(?:\.\d+)?\s*(?:°[FC])?   # range: 55-60°F
+        | (?:above|below|over|under|<|>)\s*\d{1,3}(?:\.\d+)?\s*(?:°[FC])?  # above/below
+        | \d{1,3}(?:\.\d+)?\s*(?:or\s+(?:higher|lower|more|less)|\+)        # X or higher
+        | \d{1,3}(?:\.\d+)?\s*°[FC]                                          # exact: 13°C
+        | \d{2,3}(?:\+)?°?[FC]?\s*or\s+(?:higher|lower|below|above)
+    )
+    \s*$
+    """,
+    re.VERBOSE | re.IGNORECASE
+)
+
+# Words that disqualify something from being a city name
+NOT_A_CITY = {
+    "prison", "jail", "the nba", "the nfl", "the mlb", "april", "may", "june",
+    "january", "february", "march", "july", "august", "september", "october",
+    "november", "december", "the world", "the first", "another", "a gulf",
+    "bitcoin", "crypto", "election", "market cap", "congress", "senate",
+    "the us", "the eu", "an eu", "a us", "trump", "biden", "musk",
+    "nasdaq", "s&p", "dow", "oil", "gold", "silver",
+}
+
+# Must contain at least one of these to be a temperature market question
+TEMP_QUESTION_KEYWORDS = [
+    "highest temperature", "high temperature", "temperature in",
+    "temp in", "highest temp", "daily high", "daily temperature",
 ]
 
 
@@ -37,7 +72,33 @@ class TemperatureBucket:
     noaa_match:  bool = field(default=False)
 
 
+def is_temp_outcome(text: str) -> bool:
+    """Return True only if the outcome text is a real temperature range."""
+    return bool(TEMP_OUTCOME_RE.match(text.strip()))
+
+
+def is_temp_question(text: str) -> bool:
+    """Return True if the question is about temperature."""
+    t = text.lower()
+    return any(kw in t for kw in TEMP_QUESTION_KEYWORDS)
+
+
+def is_valid_city(name: str) -> bool:
+    """Filter out non-city strings."""
+    n = name.lower().strip()
+    if len(n) < 3 or len(n) > 50:
+        return False
+    if any(bad in n for bad in NOT_A_CITY):
+        return False
+    # Must start with a letter, no digits
+    if re.search(r'\d', n):
+        return False
+    # Must look like a proper noun (real cities usually have caps when extracted)
+    return True
+
+
 def parse_temp_range(text: str):
+    """Parse bucket label → (low, high, is_above, is_below, is_celsius)."""
     is_c = "°c" in text.lower() or (
         "°f" not in text.lower() and
         bool(re.search(r"\b\d{1,2}\b", text)) and
@@ -57,7 +118,7 @@ def parse_temp_range(text: str):
     if below:
         return None, float(below.group(1)), False, True, is_c
 
-    rng = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", t)
+    rng = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(\d+(?:\.\d+)?)", t)
     if rng:
         return float(rng.group(1)), float(rng.group(2)), False, False, is_c
 
@@ -69,9 +130,7 @@ def parse_temp_range(text: str):
     return None, None, False, False, is_c
 
 
-def forecast_hits_bucket(temp_c: float, temp_f: float,
-                         low, high, is_above, is_below,
-                         is_celsius: bool) -> bool:
+def forecast_hits_bucket(temp_c, temp_f, low, high, is_above, is_below, is_celsius) -> bool:
     temp = temp_c if is_celsius else temp_f
     if is_above and low is not None:
         return temp >= low
@@ -83,62 +142,60 @@ def forecast_hits_bucket(temp_c: float, temp_f: float,
 
 
 def extract_city(text: str) -> Optional[str]:
-    """Extract city name from Polymarket event/market title."""
+    """Extract city from 'Highest temperature in <City> on ...'"""
     patterns = [
-        r"(?:highest\s+)?temperature\s+in\s+([A-Za-z][A-Za-z\s\-]+?)(?:\s+on\s+|\?|$)",
-        r"(?:highest\s+)?temp(?:erature)?\s+in\s+([A-Za-z][A-Za-z\s\-]+?)(?:\s+on\s+|\?|$)",
-        r"\bin\s+([A-Z][a-zA-Z\s\-]+?)(?:\s+on\s+|\?|$)",
+        r"(?:highest\s+)?temperature\s+in\s+([A-Za-z][A-Za-z\s\-\.]+?)(?:\s+on\s+|\?|$)",
+        r"(?:highest\s+)?temp(?:erature)?\s+in\s+([A-Za-z][A-Za-z\s\-\.]+?)(?:\s+on\s+|\?|$)",
+        r"daily\s+(?:high\s+)?temperature\s+in\s+([A-Za-z][A-Za-z\s\-\.]+?)(?:\s+on\s+|\?|$)",
     ]
     for pat in patterns:
         m = re.search(pat, text, re.I)
         if m:
             city = m.group(1).strip().rstrip("?.,").strip()
-            # Sanity check — real city names are 2-40 chars
-            if 2 < len(city) < 40:
+            if is_valid_city(city):
                 return city
     return None
 
 
 def get_title(item: dict) -> str:
-    """Get the best available title/question from an item."""
-    return (item.get("title") or
-            item.get("question") or
-            item.get("name") or
-            item.get("description") or "")
+    return (item.get("title") or item.get("question") or
+            item.get("name") or item.get("description") or "")
 
 
 def parse_outcomes(mkt: dict) -> tuple[list, list]:
-    """Extract outcomes and prices from a market dict."""
     outcomes   = mkt.get("outcomes", [])
     out_prices = mkt.get("outcomePrices", [])
-
     if isinstance(outcomes, str):
         try:   outcomes = json.loads(outcomes)
         except: outcomes = []
     if isinstance(out_prices, str):
         try:   out_prices = json.loads(out_prices)
         except: out_prices = []
-
-    # Fallback: tokens array
     if not outcomes:
         for token in mkt.get("tokens", []):
             outcomes.append(token.get("outcome", ""))
             out_prices.append(token.get("price", 0.5))
-
     return outcomes, out_prices
 
 
 def build_buckets(mkt: dict, question: str, city: str) -> list[TemperatureBucket]:
-    """Build TemperatureBucket list from a market dict."""
+    outcomes, out_prices = parse_outcomes(mkt)
+
+    # STRICT CHECK: every outcome must be a real temperature range
+    # If outcomes are just "Yes"/"No" this is not a temperature bucket market
+    temp_outcomes = [o for o in outcomes if is_temp_outcome(str(o))]
+    if not temp_outcomes or len(temp_outcomes) < len(outcomes) * 0.5:
+        return []
+
     mid    = mkt.get("id") or mkt.get("conditionId") or "unknown"
     slug   = mkt.get("slug") or mkt.get("marketSlug") or str(mid)
     volume = float(mkt.get("volume") or mkt.get("volumeNum") or 0)
     url    = f"{POLYMARKET_WEB_URL}/event/{slug}"
 
-    outcomes, out_prices = parse_outcomes(mkt)
-
     buckets = []
     for i, outcome in enumerate(outcomes):
+        if not is_temp_outcome(str(outcome)):
+            continue
         yes_price = float(out_prices[i]) if i < len(out_prices) else 0.5
         low, high, is_above, is_below, is_c = parse_temp_range(str(outcome))
         buckets.append(TemperatureBucket(
@@ -159,47 +216,37 @@ def build_buckets(mkt: dict, question: str, city: str) -> list[TemperatureBucket
 
 
 def parse_event(event: dict) -> list[TemperatureBucket]:
-    """
-    Parse a Polymarket event (which may contain nested markets).
-    The event title is the question e.g. 'Highest temperature in Atlanta on March 20?'
-    """
     event_title = get_title(event)
-    city        = extract_city(event_title)
 
+    # Quick filter: must mention temperature
+    if not is_temp_question(event_title):
+        return []
+
+    city = extract_city(event_title)
     all_buckets = []
 
-    # Case 1: Event has nested markets — each market is a bucket group
-    nested_markets = event.get("markets", [])
-    if nested_markets:
-        for mkt in nested_markets:
-            # Use event title as question since nested markets often lack one
+    nested = event.get("markets", [])
+    if nested:
+        for mkt in nested:
             question = get_title(mkt) or event_title
             mkt_city = extract_city(question) or city
             if not mkt_city:
                 continue
             buckets = build_buckets(mkt, question, mkt_city)
             all_buckets.extend(buckets)
-        return all_buckets
-
-    # Case 2: Event itself is a market (flat structure)
-    if city:
+    elif city:
         buckets = build_buckets(event, event_title, city)
         all_buckets.extend(buckets)
 
     return all_buckets
 
 
-async def fetch_page(session: aiohttp.ClientSession,
-                     base_url: str, offset: int = 0) -> list:
+async def fetch_page(session, base_url: str, offset: int = 0) -> list:
     url = f"{base_url}&offset={offset}"
     try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=15),
-            headers={"User-Agent": "Mozilla/5.0"},
-        ) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15),
+                               headers={"User-Agent": "Mozilla/5.0"}) as r:
             if r.status != 200:
-                logger.debug(f"❌ {r.status} — {url}")
                 return []
             data = await r.json(content_type=None)
             if isinstance(data, list):
@@ -218,23 +265,12 @@ async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket
     working_url = None
 
     async with aiohttp.ClientSession() as session:
-        # Find working endpoint
-        for base_url in TEMPERATURE_ENDPOINTS:
+        for base_url in ENDPOINTS:
             items = await fetch_page(session, base_url, offset=0)
             if items:
                 working_url = base_url
                 raw_events.extend(items)
-                logger.info(f"✅ Endpoint working: {base_url} — {len(items)} items")
-
-                # Log first item structure to debug
-                if items:
-                    sample = items[0]
-                    logger.info(f"📋 Sample item keys: {list(sample.keys())}")
-                    logger.info(f"📋 Sample title: {get_title(sample)}")
-                    nested = sample.get("markets", [])
-                    if nested:
-                        logger.info(f"📋 Nested markets: {len(nested)}, first keys: {list(nested[0].keys())}")
-                        logger.info(f"📋 First nested title: {get_title(nested[0])}")
+                logger.info(f"✅ Endpoint: {base_url} — {len(items)} items")
                 break
 
         if not working_url:
@@ -248,7 +284,6 @@ async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket
             if not items:
                 break
             raw_events.extend(items)
-            logger.info(f"📄 offset={offset}: {len(items)} more items")
             if len(items) < 100:
                 break
             offset += 100
@@ -256,7 +291,6 @@ async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket
 
     logger.info(f"📦 Total events fetched: {len(raw_events)}")
 
-    # Parse all events into city buckets
     city_markets: dict[str, list[TemperatureBucket]] = {}
     skipped = 0
 
@@ -268,9 +302,9 @@ async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket
         else:
             skipped += 1
 
-    total = sum(len(v) for v in city_markets.values())
+    total  = sum(len(v) for v in city_markets.values())
     cities = sorted(city_markets.keys())
-    logger.info(f"🌍 Found {total} buckets across {len(cities)} cities | {skipped} events skipped")
+    logger.info(f"🌍 {total} real temperature buckets across {len(cities)} cities | {skipped} non-temp events skipped")
     logger.info(f"🏙️  Cities: {cities}")
 
     return city_markets
