@@ -1,6 +1,6 @@
 """
-Polymarket — fetches directly from the temperature sub-category
-under the weather section. Paginates to get all markets.
+Polymarket — fetches directly from the temperature sub-category.
+Strict filtering ensures only actual temperature markets are processed.
 """
 
 import asyncio
@@ -14,19 +14,19 @@ from config import POLYMARKET_GAMMA_API, POLYMARKET_WEB_URL
 
 logger = logging.getLogger(__name__)
 
-# Temperature sub-category endpoints — tried in order
-# "temperature" is the sub-tag under "weather" on Polymarket
 TEMPERATURE_ENDPOINTS = [
     f"{POLYMARKET_GAMMA_API}/events?tag=temperature&active=true&closed=false&limit=100",
     f"{POLYMARKET_GAMMA_API}/events?tag_slug=temperature&active=true&closed=false&limit=100",
     f"{POLYMARKET_GAMMA_API}/markets?tag=temperature&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/events?category=temperature&active=true&closed=false&limit=100",
-    # Fallback: full weather category but filter client-side for temperature
     f"{POLYMARKET_GAMMA_API}/events?tag=weather&active=true&closed=false&limit=100",
 ]
 
-# How to detect a temperature market vs other weather (wind, rain, etc.)
-TEMP_KEYWORDS = ["temperature", "temp", "°f", "°c", "degrees", "highest temp", "high temp"]
+# Strict regex — market title must literally say "temperature in <City>"
+# This prevents "Rick Temple", "temperamental", etc. from matching
+TEMP_MARKET_PATTERN = re.compile(
+    r"(?:highest\s+)?temperature\s+in\s+[A-Za-z]",
+    re.IGNORECASE
+)
 
 
 @dataclass
@@ -92,29 +92,39 @@ def forecast_hits_bucket(temp_c: float, temp_f: float,
 
 
 def extract_city(question: str) -> Optional[str]:
-    """Extract city from 'Highest temperature in <City> on ...'"""
-    patterns = [
-        r"(?:highest\s+)?temperature\s+in\s+([A-Za-z\s]+?)(?:\s+on\s+|\?|$)",
-        r"(?:highest\s+)?temp\s+in\s+([A-Za-z\s]+?)(?:\s+on\s+|\?|$)",
-        r"\bin\s+([A-Z][a-zA-Z\s]+?)(?:\s+on\s+|\?|$)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, question, re.I)
-        if m:
-            city = m.group(1).strip().rstrip("?").strip()
-            if 2 < len(city) < 40:
-                return city
+    """
+    Extract city strictly from 'Highest temperature in <City> on ...'
+    Uses the same strict pattern as TEMP_MARKET_PATTERN.
+    """
+    m = re.search(
+        r"(?:highest\s+)?temperature\s+in\s+([A-Za-z][A-Za-z\s]+?)(?:\s+on\s+|\?|$)",
+        question, re.IGNORECASE
+    )
+    if m:
+        city = m.group(1).strip().rstrip("?").strip()
+        # Reject obviously wrong extractions
+        if 2 < len(city) < 40 and not any(
+            bad in city.lower() for bad in ["republican", "democrat", "senate", "election", "nominee"]
+        ):
+            return city
     return None
 
 
 def is_temperature_market(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in TEMP_KEYWORDS)
+    """
+    Strict check — must match 'temperature in <City>' pattern exactly.
+    Rejects political markets, sports, and anything else with 'temp' in a word.
+    """
+    return bool(TEMP_MARKET_PATTERN.search(question))
 
 
 def parse_market(mkt: dict, parent_question: str = "") -> list[TemperatureBucket]:
     question = mkt.get("question") or mkt.get("title") or parent_question or ""
-    if not question or not is_temperature_market(question):
+    if not question:
+        return []
+
+    # Strict filter — must be "temperature in <City>"
+    if not is_temperature_market(question):
         return []
 
     city = extract_city(question)
@@ -136,7 +146,6 @@ def parse_market(mkt: dict, parent_question: str = "") -> list[TemperatureBucket
         try:   out_prices = json.loads(out_prices)
         except: out_prices = []
 
-    # Fallback: tokens array
     if not outcomes:
         for token in mkt.get("tokens", []):
             outcomes.append(token.get("outcome", ""))
@@ -165,7 +174,6 @@ def parse_market(mkt: dict, parent_question: str = "") -> list[TemperatureBucket
 
 async def fetch_page(session: aiohttp.ClientSession,
                      url: str, offset: int = 0) -> list:
-    """Fetch one page of markets."""
     page_url = f"{url}&offset={offset}"
     try:
         async with session.get(
@@ -189,64 +197,65 @@ async def fetch_page(session: aiohttp.ClientSession,
 
 async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket]]:
     """
-    Fetch temperature markets from Polymarket.
-    Tries temperature sub-tag first, falls back to weather tag + client-side filter.
-    Paginates until no more results.
+    Fetch temperature markets from Polymarket weather section.
+    Caps at 500 markets max (today's active markets are well within this).
+    Strictly filters to 'temperature in <City>' markets only.
     """
     raw_markets = []
     working_url = None
+    MAX_MARKETS = 500   # Cap — no need to page through 8000+ historical markets
 
     async with aiohttp.ClientSession() as session:
 
-        # Find first working endpoint
         for base_url in TEMPERATURE_ENDPOINTS:
             items = await fetch_page(session, base_url, offset=0)
             if items:
                 working_url = base_url
                 raw_markets.extend(items)
-                logger.info(f"✅ Endpoint working: {base_url} → {len(items)} items (page 1)")
+                logger.info(f"✅ Endpoint: {base_url} → {len(items)} items (page 1)")
                 break
 
         if not working_url:
             logger.warning("⚠️ No Polymarket endpoint returned data.")
             return {}
 
-        # Paginate: keep fetching until we get fewer than 100 results
+        # Paginate but stop at cap
         offset = 100
-        while True:
+        while len(raw_markets) < MAX_MARKETS:
             items = await fetch_page(session, working_url, offset=offset)
             if not items:
                 break
             raw_markets.extend(items)
-            logger.info(f"📄 Page offset={offset}: {len(items)} items")
             if len(items) < 100:
                 break
             offset += 100
-            await asyncio.sleep(0.3)  # Be polite to the API
+            await asyncio.sleep(0.3)
 
-    logger.info(f"📦 Total raw items fetched: {len(raw_markets)}")
+    logger.info(f"📦 Raw items fetched: {len(raw_markets)} (capped at {MAX_MARKETS})")
 
-    # Flatten events → nested markets, then parse
+    # Parse — strict filter applied inside parse_market()
     city_markets: dict[str, list[TemperatureBucket]] = {}
+    skipped = 0
 
     for item in raw_markets:
         parent_q = item.get("title") or item.get("question") or ""
         nested   = item.get("markets", [])
 
-        if nested:
-            for mkt in nested:
-                buckets = parse_market(mkt, parent_question=parent_q)
+        targets = nested if nested else [item]
+        for mkt in targets:
+            pq = parent_q if nested else ""
+            buckets = parse_market(mkt, parent_question=pq)
+            if buckets:
                 for b in buckets:
                     city_markets.setdefault(b.city, []).append(b)
-        else:
-            buckets = parse_market(item)
-            for b in buckets:
-                city_markets.setdefault(b.city, []).append(b)
+            else:
+                skipped += 1
 
-    # Log what we found
     total_buckets = sum(len(v) for v in city_markets.values())
     cities_found  = sorted(city_markets.keys())
-    logger.info(f"🌍 Temperature markets found: {total_buckets} buckets across {len(cities_found)} cities")
+
+    logger.info(f"✅ Temperature markets: {total_buckets} buckets across {len(cities_found)} cities")
     logger.info(f"🏙️  Cities: {cities_found}")
+    logger.info(f"🗑️  Non-temperature markets skipped: {skipped}")
 
     return city_markets
