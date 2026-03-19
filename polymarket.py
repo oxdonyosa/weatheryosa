@@ -1,6 +1,6 @@
 """
-Polymarket — fetches ALL active markets from the weather section dynamically.
-Cities are NOT hardcoded — we extract them from market titles.
+Polymarket — fetches directly from the temperature sub-category
+under the weather section. Paginates to get all markets.
 """
 
 import asyncio
@@ -14,20 +14,25 @@ from config import POLYMARKET_GAMMA_API, POLYMARKET_WEB_URL
 
 logger = logging.getLogger(__name__)
 
-# Polymarket weather section endpoints — try in order
-WEATHER_ENDPOINTS = [
+# Temperature sub-category endpoints — tried in order
+# "temperature" is the sub-tag under "weather" on Polymarket
+TEMPERATURE_ENDPOINTS = [
+    f"{POLYMARKET_GAMMA_API}/events?tag=temperature&active=true&closed=false&limit=100",
+    f"{POLYMARKET_GAMMA_API}/events?tag_slug=temperature&active=true&closed=false&limit=100",
+    f"{POLYMARKET_GAMMA_API}/markets?tag=temperature&active=true&closed=false&limit=100",
+    f"{POLYMARKET_GAMMA_API}/events?category=temperature&active=true&closed=false&limit=100",
+    # Fallback: full weather category but filter client-side for temperature
     f"{POLYMARKET_GAMMA_API}/events?tag=weather&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/events?tag_slug=weather&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/markets?tag=weather&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/markets?category=weather&active=true&closed=false&limit=100",
-    f"{POLYMARKET_GAMMA_API}/events?category=weather&active=true&closed=false&limit=100",
 ]
+
+# How to detect a temperature market vs other weather (wind, rain, etc.)
+TEMP_KEYWORDS = ["temperature", "temp", "°f", "°c", "degrees", "highest temp", "high temp"]
 
 
 @dataclass
 class TemperatureBucket:
     market_id:   str
-    city:        str           # Extracted from market title
+    city:        str
     question:    str
     outcome:     str
     yes_price:   float
@@ -36,16 +41,18 @@ class TemperatureBucket:
     high_bound:  Optional[float]
     is_above:    bool
     is_below:    bool
-    is_celsius:  bool          # True if market uses °C
+    is_celsius:  bool
     market_url:  str
-    noaa_match:  bool = field(default=False)   # Set by signal engine
+    noaa_match:  bool = field(default=False)
 
 
 def parse_temp_range(text: str):
-    """Parse bucket label → (low, high, is_above, is_below, is_celsius)."""
-    is_c = "°C" in text or ("°F" not in text and re.search(r"\b\d{1,2}\b", text) and
-                             not re.search(r"\b[5-9]\d\b|\b1[0-1]\d\b", text))
-    t    = text.replace("°F", "").replace("°C", "").replace("°", "").strip()
+    is_c = "°c" in text.lower() or (
+        "°f" not in text.lower() and
+        bool(re.search(r"\b[0-9]{1,2}\b", text)) and
+        not bool(re.search(r"\b[5-9]\d\b|\b1[0-1]\d\b", text))
+    )
+    t = re.sub(r"°[fFcC]|°", "", text).strip()
 
     above = re.search(r"(?:above|over|>\s*)\s*(\d+(?:\.\d+)?)", t, re.I)
     if not above:
@@ -72,11 +79,9 @@ def parse_temp_range(text: str):
 
 
 def forecast_hits_bucket(temp_c: float, temp_f: float,
-                          low, high, is_above, is_below,
-                          is_celsius: bool) -> bool:
-    """Check if forecast temperature falls in this bucket (handles °C and °F)."""
+                         low, high, is_above, is_below,
+                         is_celsius: bool) -> bool:
     temp = temp_c if is_celsius else temp_f
-
     if is_above and low is not None:
         return temp >= low
     if is_below and high is not None:
@@ -86,33 +91,33 @@ def forecast_hits_bucket(temp_c: float, temp_f: float,
     return False
 
 
-def extract_city_from_question(question: str) -> Optional[str]:
-    """Pull city name from 'Highest temperature in <City> on ...'"""
-    m = re.search(r"(?:temperature in|temp in|weather in)\s+([^?on]+?)(?:\s+on\s+|\?|$)",
-                  question, re.I)
-    if m:
-        return m.group(1).strip()
-    # Fallback: look for "in <City>" pattern
-    m2 = re.search(r"\bin\s+([A-Z][a-zA-Z\s]+?)(?:\s+on|\?|$)", question)
-    if m2:
-        return m2.group(1).strip()
+def extract_city(question: str) -> Optional[str]:
+    """Extract city from 'Highest temperature in <City> on ...'"""
+    patterns = [
+        r"(?:highest\s+)?temperature\s+in\s+([A-Za-z\s]+?)(?:\s+on\s+|\?|$)",
+        r"(?:highest\s+)?temp\s+in\s+([A-Za-z\s]+?)(?:\s+on\s+|\?|$)",
+        r"\bin\s+([A-Z][a-zA-Z\s]+?)(?:\s+on\s+|\?|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, question, re.I)
+        if m:
+            city = m.group(1).strip().rstrip("?").strip()
+            if 2 < len(city) < 40:
+                return city
     return None
 
 
-def parse_market_to_buckets(mkt: dict) -> list[TemperatureBucket]:
-    """Convert a raw Polymarket market dict → list of TemperatureBucket."""
-    question = mkt.get("question") or mkt.get("title") or ""
-    if not question:
+def is_temperature_market(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in TEMP_KEYWORDS)
+
+
+def parse_market(mkt: dict, parent_question: str = "") -> list[TemperatureBucket]:
+    question = mkt.get("question") or mkt.get("title") or parent_question or ""
+    if not question or not is_temperature_market(question):
         return []
 
-    # Only temperature/weather markets
-    q_lower = question.lower()
-    if not any(kw in q_lower for kw in ["temperature", "temp", "°", "degrees"]):
-        return []
-    if "highest temperature" not in q_lower and "temperature" not in q_lower:
-        return []
-
-    city = extract_city_from_question(question)
+    city = extract_city(question)
     if not city:
         return []
 
@@ -131,6 +136,7 @@ def parse_market_to_buckets(mkt: dict) -> list[TemperatureBucket]:
         try:   out_prices = json.loads(out_prices)
         except: out_prices = []
 
+    # Fallback: tokens array
     if not outcomes:
         for token in mkt.get("tokens", []):
             outcomes.append(token.get("outcome", ""))
@@ -157,67 +163,90 @@ def parse_market_to_buckets(mkt: dict) -> list[TemperatureBucket]:
     return buckets
 
 
+async def fetch_page(session: aiohttp.ClientSession,
+                     url: str, offset: int = 0) -> list:
+    """Fetch one page of markets."""
+    page_url = f"{url}&offset={offset}"
+    try:
+        async with session.get(
+            page_url,
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as r:
+            if r.status != 200:
+                return []
+            data = await r.json(content_type=None)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("events", "markets", "data", "results"):
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+    except Exception as e:
+        logger.debug(f"Page fetch error {page_url}: {e}")
+    return []
+
+
 async def fetch_polymarket_weather_section() -> dict[str, list[TemperatureBucket]]:
     """
-    Fetch ALL markets from Polymarket weather section in one shot.
-    Returns dict: city_name → list of TemperatureBucket
-    Cities are extracted dynamically from market titles — no hardcoding.
+    Fetch temperature markets from Polymarket.
+    Tries temperature sub-tag first, falls back to weather tag + client-side filter.
+    Paginates until no more results.
     """
     raw_markets = []
+    working_url = None
 
     async with aiohttp.ClientSession() as session:
-        for url in WEATHER_ENDPOINTS:
-            try:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    headers={"User-Agent": "Mozilla/5.0"}
-                ) as r:
-                    if r.status != 200:
-                        logger.debug(f"❌ {r.status} — {url}")
-                        continue
 
-                    data = await r.json(content_type=None)
+        # Find first working endpoint
+        for base_url in TEMPERATURE_ENDPOINTS:
+            items = await fetch_page(session, base_url, offset=0)
+            if items:
+                working_url = base_url
+                raw_markets.extend(items)
+                logger.info(f"✅ Endpoint working: {base_url} → {len(items)} items (page 1)")
+                break
 
-                    if isinstance(data, list):
-                        items = data
-                    elif isinstance(data, dict):
-                        items = (data.get("events") or data.get("markets")
-                                 or data.get("data") or data.get("results") or [])
-                    else:
-                        continue
+        if not working_url:
+            logger.warning("⚠️ No Polymarket endpoint returned data.")
+            return {}
 
-                    if not items:
-                        continue
+        # Paginate: keep fetching until we get fewer than 100 results
+        offset = 100
+        while True:
+            items = await fetch_page(session, working_url, offset=offset)
+            if not items:
+                break
+            raw_markets.extend(items)
+            logger.info(f"📄 Page offset={offset}: {len(items)} items")
+            if len(items) < 100:
+                break
+            offset += 100
+            await asyncio.sleep(0.3)  # Be polite to the API
 
-                    # Flatten: events contain nested markets
-                    for item in items:
-                        nested = item.get("markets", [])
-                        if nested:
-                            for m in nested:
-                                if not m.get("question"):
-                                    m["question"] = item.get("title") or item.get("question", "")
-                            raw_markets.extend(nested)
-                        else:
-                            raw_markets.append(item)
+    logger.info(f"📦 Total raw items fetched: {len(raw_markets)}")
 
-                    logger.info(f"✅ Polymarket weather section: {len(raw_markets)} raw markets from {url}")
-                    break
-
-            except Exception as e:
-                logger.debug(f"Endpoint error {url}: {e}")
-
-    if not raw_markets:
-        logger.warning("⚠️ No markets fetched from Polymarket weather section.")
-        return {}
-
-    # Parse all markets → buckets, grouped by city
+    # Flatten events → nested markets, then parse
     city_markets: dict[str, list[TemperatureBucket]] = {}
-    for mkt in raw_markets:
-        buckets = parse_market_to_buckets(mkt)
-        for b in buckets:
-            city_markets.setdefault(b.city, []).append(b)
 
-    cities_found = list(city_markets.keys())
-    logger.info(f"🌍 Cities found in Polymarket weather section: {cities_found}")
+    for item in raw_markets:
+        parent_q = item.get("title") or item.get("question") or ""
+        nested   = item.get("markets", [])
+
+        if nested:
+            for mkt in nested:
+                buckets = parse_market(mkt, parent_question=parent_q)
+                for b in buckets:
+                    city_markets.setdefault(b.city, []).append(b)
+        else:
+            buckets = parse_market(item)
+            for b in buckets:
+                city_markets.setdefault(b.city, []).append(b)
+
+    # Log what we found
+    total_buckets = sum(len(v) for v in city_markets.values())
+    cities_found  = sorted(city_markets.keys())
+    logger.info(f"🌍 Temperature markets found: {total_buckets} buckets across {len(cities_found)} cities")
+    logger.info(f"🏙️  Cities: {cities_found}")
+
     return city_markets
