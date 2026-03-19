@@ -9,7 +9,7 @@ from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from config import (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                    ENTRY_THRESHOLD, EXIT_THRESHOLD, SCAN_INTERVAL_SECONDS, CITIES)
+                    ENTRY_THRESHOLD, EXIT_THRESHOLD, SCAN_INTERVAL_SECONDS)
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,7 @@ bot_state = {
     "total_signals": 0,
     "last_signals":  [],
     "scan_count":    0,
+    "active_cities": [],
 }
 
 _app: Application = None
@@ -25,12 +26,11 @@ _app: Application = None
 
 async def send_signal_message(text: str):
     if not _app or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not configured — cannot send message.")
+        logger.warning("Telegram not configured.")
         return
     try:
         await _app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
+            chat_id=TELEGRAM_CHAT_ID, text=text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
         )
@@ -39,19 +39,25 @@ async def send_signal_message(text: str):
 
 
 async def reply(update: Update, text: str):
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    disable_web_page_preview=True)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update,
         "👋 *Polymarket Weather Signal Bot*\n\n"
-        "I scan NOAA forecast data vs Polymarket weather prices every 2 minutes "
-        "and alert you when the market is mispriced.\n\n"
+        "I pull live markets from the *Polymarket weather section*, cross-reference "
+        "every bucket with NOAA (US) or Open-Meteo (global) forecasts, "
+        "and alert you when the market is mispriced — or when there's a strong conviction play.\n\n"
+        "*Signal Types:*\n"
+        "🟢 *BUY* — Forecast says YES, market < 15%\n"
+        "🔴 *AVOID* — Forecast says NO, market > 45%\n"
+        "💎 *CONVICTION* — Forecast strongly agrees with top bucket\n\n"
         "*Commands:*\n"
         "/status — Bot status & last scan\n"
+        "/cities — Cities active on Polymarket right now\n"
         "/config — Strategy settings\n"
-        "/cities — Monitored cities\n"
         "/lastsignals — Signals from last scan\n"
         "/help — This message\n\n"
         "⚠️ _Signals only — not financial advice._"
@@ -71,6 +77,18 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_cities(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cities = bot_state.get("active_cities", [])
+    if not cities:
+        await reply(update, "😴 No scan run yet — cities will appear after first scan.")
+        return
+    city_list = "\n".join(f"  • {c}" for c in sorted(cities))
+    await reply(update,
+        f"🌍 *Cities Active on Polymarket* ({len(cities)})\n\n{city_list}\n\n"
+        f"_Updates every scan. Cities come directly from Polymarket's weather section._"
+    )
+
+
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update,
         f"⚙️ *Strategy Configuration*\n\n"
@@ -78,15 +96,14 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📤 Exit threshold: `{EXIT_THRESHOLD * 100:.0f}%`\n"
         f"🔁 Scan interval: every `{SCAN_INTERVAL_SECONDS // 60}` minutes\n\n"
         f"*Signal Logic:*\n"
-        f"• 🟢 BUY → NOAA says YES, price < {ENTRY_THRESHOLD:.0%}\n"
-        f"• 🔴 AVOID → NOAA says NO, price > {EXIT_THRESHOLD:.0%}\n\n"
-        f"_Edit Railway environment variables to adjust._"
+        f"🟢 BUY → forecast in bucket + price < {ENTRY_THRESHOLD:.0%}\n"
+        f"🔴 AVOID → forecast not in bucket + price > {EXIT_THRESHOLD:.0%}\n"
+        f"💎 CONVICTION → forecast matches top bucket with strong edge\n\n"
+        f"*Weather Sources:*\n"
+        f"🇺🇸 US cities → NOAA weather.gov\n"
+        f"🌍 Global cities → Open-Meteo\n\n"
+        f"_Edit Railway Variables tab to change thresholds._"
     )
-
-
-async def cmd_cities(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    city_list = "\n".join(f"  • {c}" for c in CITIES.keys())
-    await reply(update, f"📍 *Monitored Cities* ({len(CITIES)})\n\n{city_list}")
 
 
 async def cmd_lastsignals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -114,8 +131,8 @@ async def run_telegram_bot():
     for cmd, fn in [
         ("start",       cmd_start),
         ("status",      cmd_status),
-        ("config",      cmd_config),
         ("cities",      cmd_cities),
+        ("config",      cmd_config),
         ("lastsignals", cmd_lastsignals),
         ("help",        cmd_help),
     ]:
@@ -124,8 +141,8 @@ async def run_telegram_bot():
     await _app.bot.set_my_commands([
         BotCommand("start",       "Welcome & intro"),
         BotCommand("status",      "Bot status & last scan"),
+        BotCommand("cities",      "Active cities on Polymarket"),
         BotCommand("config",      "Strategy settings"),
-        BotCommand("cities",      "Monitored cities"),
         BotCommand("lastsignals", "Signals from last scan"),
         BotCommand("help",        "Help menu"),
     ])

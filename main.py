@@ -1,8 +1,5 @@
 """
-Polymarket Weather Signal Bot
-Scans NOAA forecast data vs Polymarket weather market prices
-and sends Telegram signals when mispricing is detected.
-NO AUTO-TRADING — signals only.
+Polymarket Weather Signal Bot — entry point.
 """
 
 import asyncio
@@ -19,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 async def main():
     logger.info("🚀 Polymarket Weather Signal Bot starting...")
-    logger.info("📡 Monitoring: NYC, Chicago, Seattle, Atlanta, Dallas, Miami")
-    logger.info("⚡ Scan interval: every 2 minutes")
-    logger.info("📊 Entry threshold: 15% | Exit threshold: 45%")
+    logger.info("🌍 Cities: dynamic — pulled from Polymarket weather section each scan")
+    logger.info("📡 Weather: NOAA (US) + Open-Meteo (global)")
+    logger.info("⚡ Signals: 🟢 BUY | 🔴 AVOID | 💎 CONVICTION")
+    logger.info(f"🔁 Scan interval: every 2 minutes")
 
     await asyncio.gather(
         start_scheduler(),
